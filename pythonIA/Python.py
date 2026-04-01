@@ -706,6 +706,98 @@ def _preprocess_for_ocr(img_bgr: np.ndarray) -> np.ndarray:
     return cv2.addWeighted(gray, 1.5, blur, -0.5, 0)
 
 
+def _crop_quiz_card_if_found(img_bgr: np.ndarray) -> np.ndarray:
+    """
+    Tenta recortar o card do quiz (Canvas/LMS) para reduzir ruído de sidebar/header.
+    Heurística: encontrar o maior retângulo escuro na metade direita (onde fica o conteúdo).
+    """
+    try:
+        h, w = img_bgr.shape[:2]
+        if h < 300 or w < 400:
+            return img_bgr
+        # focar na área principal (ignorar sidebar esquerda)
+        x0 = int(w * 0.22)
+        roi = img_bgr[:, x0:].copy()
+        g = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        # máscara de pixels escuros (card)
+        _, m = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        # limpar ruído e unir regiões
+        k = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k, iterations=2)
+        cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts:
+            return img_bgr
+        best = None
+        best_area = 0
+        for c in cnts:
+            x, y, cw, ch = cv2.boundingRect(c)
+            area = cw * ch
+            if area < best_area:
+                continue
+            # card típico é grande e “retangular”
+            if cw < int((w - x0) * 0.35) or ch < int(h * 0.25):
+                continue
+            ar = cw / max(ch, 1)
+            if ar < 0.7 or ar > 4.5:
+                continue
+            best = (x, y, cw, ch)
+            best_area = area
+        if not best:
+            return img_bgr
+        x, y, cw, ch = best
+        pad = 18
+        xA = max(0, x0 + x - pad)
+        yA = max(0, y - pad)
+        xB = min(w, x0 + x + cw + pad)
+        yB = min(h, y + ch + pad)
+        cropped = img_bgr[yA:yB, xA:xB].copy()
+        # evitar recorte absurdo
+        if cropped.shape[0] < 220 or cropped.shape[1] < 300:
+            return img_bgr
+        return cropped
+    except Exception:
+        return img_bgr
+
+
+def _ocr_best_of_variants(img_bgr: np.ndarray, lang: str, config: str) -> tuple[list[dict], str]:
+    """
+    Tenta variantes de OCR (recorte + preprocess diferentes) e escolhe a melhor
+    pela quantidade/qualidade de linhas.
+    """
+    variants: list[tuple[str, np.ndarray]] = []
+
+    base = _crop_quiz_card_if_found(img_bgr)
+    variants.append(("crop+otsu", _preprocess_for_ocr(base)))
+
+    # Variante: adaptive threshold (melhor para fundo irregular/anti-alias)
+    try:
+        g = cv2.cvtColor(base, cv2.COLOR_BGR2GRAY)
+        g = cv2.GaussianBlur(g, (3, 3), 0)
+        ad = cv2.adaptiveThreshold(
+            g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 41, 7
+        )
+        if float(np.mean(ad)) < 80:
+            ad = 255 - ad
+        variants.append(("crop+adaptive", ad))
+    except Exception:
+        pass
+
+    best_lines: list[dict] = []
+    best_raw = ""
+    best_score = -1.0
+    for _name, proc in variants:
+        lines, raw = _ocr_to_structured_lines(proc, lang, config)
+        filtered = _filter_structured_lines(lines)
+        # score: mais linhas + mais palavras “úteis”
+        wc = sum(int(ln.get("word_count") or 0) for ln in filtered)
+        score = len(filtered) * 3 + wc
+        if score > best_score:
+            best_score = score
+            best_lines = filtered
+            best_raw = raw
+    return best_lines, best_raw
+
+
 _MIN_WORD_CONF = int(os.environ.get("OCR_MIN_WORD_CONF", "15"))
 
 
@@ -1350,17 +1442,12 @@ class InvisibleScreenCapture:
 
     def analyze_image(self, img, is_full_screen: bool = False):
         img = _crop_image_bgr(img, is_full_screen=is_full_screen)
-        proc = _preprocess_for_ocr(img)
-
-        structured_lines, raw_text = _ocr_to_structured_lines(
-            proc, _TESSERACT_LANG, _TESSERACT_CONFIG,
-        )
-        filtered = _filter_structured_lines(structured_lines)
+        filtered, raw_text = _ocr_best_of_variants(img, _TESSERACT_LANG, _TESSERACT_CONFIG)
         questions, options_by_question = _parse_questions_structured(filtered)
         summaries = _summarize_items(questions, options_by_question)
 
 
-        filtered_text = "\n".join(ln["text"] for ln in filtered)
+        filtered_text = "\n".join(ln["text"] for ln in (filtered or []))
         llm_compact = _build_llm_compact_block(questions, options_by_question)
         return {
             "full_text": raw_text,

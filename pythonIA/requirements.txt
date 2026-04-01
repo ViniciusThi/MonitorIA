@@ -9,3 +9,7 @@ Pillow>=10.0.0
 # Backend principal (AirLLM-only)
 airllm
 torch
+
+# Opcional (STT / transcrição de áudio local)
+# sounddevice
+# faster-whisper
