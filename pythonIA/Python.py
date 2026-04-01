@@ -2,8 +2,11 @@ import ctypes
 import os
 import re
 import threading
+import time
 import tkinter as tk
 from tkinter import ttk
+import json
+import webbrowser
 
 import cv2
 import keyboard
@@ -12,11 +15,11 @@ import numpy as np
 import pytesseract
 import win32gui
 
-from ollama_client import (
-    build_quiz_refine_prompt,
-    ollama_complete,
-    parse_items_from_llm_response,
-)
+from local_web import CaptureStore, start_web_server
+from prompts import build_quiz_extract_prompt, build_quiz_refine_prompt, build_quiz_suggest_prompt
+from llm_json import parse_items_from_llm_response
+from llm_providers import LLMUnavailableError
+from airllm_client import AirLLMConfig, AirLLMProvider
 
 # Tesseract: TESSERACT_CMD no ambiente ou caminho padrão no Windows
 _tess_cmd = os.environ.get("TESSERACT_CMD")
@@ -33,11 +36,12 @@ elif os.name == "nt":
             pytesseract.pytesseract.tesseract_cmd = _path
             break
 
+# PSM 6 costuma funcionar melhor para blocos com múltiplas linhas e opções (Canvas/LMS).
 _TESSERACT_CONFIG = os.environ.get("TESSERACT_CONFIG", r"--oem 3 --psm 6")
 _TESSERACT_LANG = os.environ.get("TESSERACT_LANG", "eng+por")
 
 _OPTION_LINE_RE = re.compile(
-    r"^(\d{1,2}|[A-Ea-e])[\.\)\:\-\s]\s*\S",
+    r"^(\d{1,2}|[A-Ha-h])[\.\)\:\-\s]\s*\S",
     re.UNICODE,
 )
 # Linha começando com dígito + palavra (OCR às vezes come "1. " do "1. An API...")
@@ -51,7 +55,11 @@ _BREADCRUMB_ASSIGNMENTS_RE = re.compile(
     r"^\s*[\d\-]+\s*>\s*Assignments|>\s*Assignments\s*»|ACDv2EN|LTI13-\d+",
     re.I,
 )
-_UNNUM_MCQ_START_RE = re.compile(r"^(An API\b|A proxy\b|A service\b)", re.I)
+# Opções em LMS/Canvas muitas vezes não vêm numeradas no OCR (radio buttons).
+_UNNUM_MCQ_START_RE = re.compile(
+    r"^(An API\b|A proxy\b|A service\b|Export\b|Use\b|Create\b|Select\b|Choose\b|Enable\b|Disable\b)",
+    re.I,
+)
 _DATE_TASKBAR_RE = re.compile(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b")
 _LMS_MENU_ONLY_RE = re.compile(
     r"^(KEYBOARD\s+NAVIGATION|Dashboard|Calendar|Inbox|Account|Modules?|Grades?|"
@@ -59,14 +67,94 @@ _LMS_MENU_ONLY_RE = re.compile(
     re.I,
 )
 _OPTION_BLOCK_SPLIT_RE = re.compile(
-    r"(?m)^\s*[oO,]*\s*([1-6])\.\s+(.+?)(?=^\s*[oO,]*\s*[1-6]\.\s+|\Z)",
+    # Suporta 1..10 (às vezes OCR traz 10.), e tolera ruído tipo "o 1."
+    r"(?m)^\s*[oO,]*\s*([1-9]\d?)\.\s+(.+?)(?=^\s*[oO,]*\s*[1-9]\d?\.\s+|\Z)",
     re.DOTALL,
 )
-_MAX_OPTIONS_PER_QUESTION = 6
+_MAX_OPTIONS_PER_QUESTION = 10
+
+
+def _norm_for_match(s: str) -> str:
+    s = (s or "").lower().strip()
+    s = re.sub(r"^\s*([a-h]|\d{1,2})[\.\)\:\-]\s*", "", s, flags=re.I)
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"[^a-z0-9áàâãéêíóôõúç\s]", "", s, flags=re.I)
+    return s.strip()
+
+
+def _best_fuzzy_match_index(target: str, candidates: list[str]) -> tuple[int, float]:
+    """Retorna (idx, score 0..1) do melhor match por similaridade (stdlib)."""
+    import difflib
+
+    t = _norm_for_match(target)
+    if not t or not candidates:
+        return -1, 0.0
+    best_i, best_s = -1, 0.0
+    for i, c in enumerate(candidates):
+        cs = _norm_for_match(c)
+        if not cs:
+            continue
+        s = difflib.SequenceMatcher(a=t, b=cs).ratio()
+        if s > best_s:
+            best_i, best_s = i, s
+    return best_i, best_s
+
+
+def _align_llm_item_to_ocr(it: dict, ocr_opts: list[str]) -> None:
+    """
+    Alinha opções do LLM com as opções do OCR e garante que 'suggested' aponte para o OCR.
+    Adiciona campos:
+      - suggested_ocr: letra A.. (índice no OCR)
+      - suggested_text: texto da opção OCR correspondente
+      - options_ocr: lista de opções OCR (normalizada)
+    """
+    if not isinstance(it, dict):
+        return
+    ocr_opts = [str(o).strip() for o in (ocr_opts or []) if str(o).strip()]
+    if not ocr_opts:
+        return
+
+    it["options_ocr"] = ocr_opts
+
+    sug = (it.get("suggested") or "").strip()
+    if not sug:
+        return
+
+    # Primeiro, tentar mapear sugestão diretamente para OCR (A/B/1/2 etc)
+    label, full = InvisibleScreenCapture._option_text_for_suggestion(sug, ocr_opts)
+    if full:
+        it["suggested_ocr"] = label.upper() if label else sug.upper()
+        it["suggested_text"] = full
+        return
+
+    # Se não casou, tentar fuzzy-match usando as opções que o LLM retornou
+    llm_opts = it.get("options") if isinstance(it.get("options"), list) else []
+    llm_opts = [str(o).strip() for o in llm_opts if str(o).strip()]
+    if not llm_opts:
+        return
+
+    # Descobrir qual opção o LLM “quis dizer”
+    _lab, llm_full = InvisibleScreenCapture._option_text_for_suggestion(sug, llm_opts)
+    if not llm_full:
+        return
+
+    idx, score = _best_fuzzy_match_index(llm_full, ocr_opts)
+    if idx >= 0 and score >= 0.72:
+        it["suggested_ocr"] = chr(65 + idx)
+        it["suggested_text"] = ocr_opts[idx]
+        if not (it.get("note") or "").strip():
+            it["note"] = f"Realinhado por similaridade (score={score:.2f})."
 
 
 def _env_flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_flag_default(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
 def _parse_crop_frac(env_name: str, default: str) -> float:
@@ -142,12 +230,12 @@ def _split_options_from_block(block: str, max_opts: int = _MAX_OPTIONS_PER_QUEST
     if len(opts) >= 2:
         return opts
     glued = re.sub(r"\s+", " ", block)
-    if re.search(r"\b[1-4]\.\s+[A-Za-z]", glued):
-        parts = re.split(r"(?=\b[1-4]\.\s+)", glued)
+    if re.search(r"\b[1-8]\.\s+[A-Za-z]", glued):
+        parts = re.split(r"(?=\b[1-8]\.\s+)", glued)
         out: list[str] = []
         for p in parts:
             p = p.strip()
-            if re.match(r"^[1-4]\.\s+\S", p) and len(p) > 15 and not _is_junk_continuation_line(p):
+            if re.match(r"^[1-8]\.\s+\S", p) and len(p) > 15 and not _is_junk_continuation_line(p):
                 out.append(p)
         if len(out) >= 2:
             return out[:max_opts]
@@ -192,17 +280,20 @@ def _split_unnumbered_mcq_lines(block_lines: list[str], max_opts: int = _MAX_OPT
         if _UNNUM_MCQ_START_RE.match(c):
             opts.append(c)
             continue
-        if re.match(r"^An \w+", c, re.I) and len(c) > 22:
+        if re.match(r"^(An|A)\s+\w+", c, re.I) and len(c) > 22:
             opts.append(c)
             continue
         if opts and _is_continuation_mcq_line(c):
             opts[-1] = (opts[-1] + " " + c).strip()
             continue
+        # Heurística mais geral: linha “frase” com inicial maiúscula pode ser opção.
         if not opts:
+            # só começa a coletar se a linha estiver com cara de alternativa
+            if len(c) > 18 and c[0].isupper() and not _is_question_text(c):
+                if not _looks_like_url_line(c):
+                    opts.append(c)
             continue
-        if len(c) > 35 and c[0].isupper() and re.search(
-            r"\b(API|proxy|server|client|HTTP|REST)\b", c, re.I
-        ):
+        if len(c) > 12 and c[0].isupper() and not _is_question_text(c) and not _looks_like_url_line(c):
             opts.append(c)
     return opts[:max_opts]
 
@@ -237,6 +328,197 @@ def _build_llm_compact_block(questions: list[str], options_by_question: list[lis
     return "\n".join(parts).strip()
 
 
+def _collect_options_by_geometry(
+    lines: list[dict], q_x0: int, max_opts: int = _MAX_OPTIONS_PER_QUESTION,
+) -> list[str]:
+    """Detecta opções por indentação (x0) relativa à pergunta + padrões de início de opção."""
+    if not lines:
+        return []
+    opts: list[str] = []
+    for ln in lines:
+        s = ln["text"].strip()
+        if not s or _is_junk_continuation_line(s):
+            continue
+        if _line_looks_like_option_start(s):
+            opts.append(s)
+            if len(opts) >= max_opts:
+                break
+            continue
+        if ln["x0"] > q_x0 + 15 and len(s) > 20 and not _looks_like_url_line(s):
+            if opts and not _line_looks_like_option_start(s):
+                prev = opts[-1]
+                if not prev.rstrip().endswith((".", "!", "?")):
+                    opts[-1] = (prev + " " + s).strip()
+            elif s[0].isupper() and len(s) > 30:
+                opts.append(s)
+    return opts[:max_opts]
+
+
+def _pick_best_options_extended(
+    split_opts: list[str],
+    fallback_opts: list[str],
+    unnum_opts: list[str],
+    geo_opts: list[str],
+) -> list[str]:
+    """Escolhe o melhor conjunto de opções entre 4 estratégias de extração."""
+    def score(lst: list[str]) -> tuple[int, int]:
+        if not lst:
+            return (-1, 0)
+        n = len(lst)
+        total = sum(len(x) for x in lst)
+        return (n, -abs(total - 400))
+
+    candidates = [split_opts, fallback_opts, unnum_opts, geo_opts]
+    best = max(candidates, key=score)
+    if score(best)[0] < 0:
+        return []
+    return best
+
+
+_Q_START_RE = re.compile(
+    r"^(\d+\.\s*)?(Qual|Como|Que|Q:|Pergunta:|Which|What|Select|Choose)\b",
+    re.I,
+)
+_WH_AUX_RE = re.compile(
+    r"^(\d+\.\s*)?(How|When|Where|Why)\s+"
+    r"(do|does|did|is|are|can|could|should|would|will|must|many|much|to)\b",
+    re.I,
+)
+
+
+def _is_question_text(s: str) -> bool:
+    """Retorna True se o texto parece ser o início de uma pergunta."""
+    s = s.strip()
+    if _looks_like_url_line(s):
+        return False
+    if _BREADCRUMB_ASSIGNMENTS_RE.search(s) and "Which" not in s and "What" not in s:
+        return False
+    if s and s[0].islower() and "?" not in s:
+        if not re.match(
+            r"^(which|what|how|when|where|why|select|choose|qual|como|quando|onde)\b",
+            s, re.I,
+        ):
+            return False
+    if _Q_START_RE.match(s):
+        return True
+    if _WH_AUX_RE.match(s):
+        return True
+    if "?" in s and not _URL_FRAGMENT_RE.search(s):
+        if len(s) < 500 and re.search(
+            r"\b(describe|best|correct|true|false|select|choose|suggests|option|phrase)\b",
+            s, re.I,
+        ):
+            return True
+    return False
+
+
+def _parse_questions_structured(
+    lines: list[dict],
+) -> tuple[list[str], list[list[str]]]:
+    """
+    Parser de perguntas/opções usando padrões de texto + geometria (x0/y0).
+    Agrupa continuações de enunciado por proximidade de x0 e mescla linhas.
+    """
+    if not lines:
+        return [], []
+
+    questions: list[str] = []
+    options_by_question: list[list[str]] = []
+
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
+        if _is_question_text(ln["text"]):
+            q_text = _clean_question_line(ln["text"])
+            q_x0 = ln["x0"]
+
+            j = i + 1
+            while j < len(lines):
+                nxt = lines[j]
+                ns = nxt["text"].strip()
+                if _is_question_text(ns):
+                    break
+                if _line_looks_like_option_start(ns):
+                    break
+                starts_lower = ns and (
+                    ns[0].islower()
+                    or ns.startswith(("that ", "and ", "which ", "of the ", "to the ", "Select ", "style"))
+                )
+                starts_upper_cont = (
+                    ns and ns[0].isupper()
+                    and not _line_looks_like_option_start(ns)
+                    and not _is_question_text(ns)
+                )
+                is_cont = (
+                    abs(nxt["x0"] - q_x0) < 60
+                    and ns
+                    and (starts_lower or starts_upper_cont)
+                    and len(q_text) < 500
+                    and not _is_junk_continuation_line(ns)
+                )
+                if is_cont:
+                    q_text = q_text + " " + ns
+                    j += 1
+                    continue
+                break
+
+            questions.append(q_text if q_text else ln["text"])
+
+            block_text_lines: list[str] = []
+            block_structured: list[dict] = []
+            while j < len(lines):
+                candidate = lines[j]
+                if _is_question_text(candidate["text"]):
+                    break
+                block_text_lines.append(candidate["text"])
+                block_structured.append(candidate)
+                j += 1
+
+            block_text = "\n".join(block_text_lines)
+            split_opts = _split_options_from_block(block_text, _MAX_OPTIONS_PER_QUESTION)
+            fb_opts = _fallback_collect_options(block_text_lines, _MAX_OPTIONS_PER_QUESTION)
+            un_opts = _split_unnumbered_mcq_lines(block_text_lines, _MAX_OPTIONS_PER_QUESTION)
+            geo_opts = _collect_options_by_geometry(block_structured, q_x0)
+
+            opts = _pick_best_options_extended(split_opts, fb_opts, un_opts, geo_opts)
+            options_by_question.append(opts)
+            i = j
+            continue
+        i += 1
+
+    return questions, options_by_question
+
+
+def _summarize_items(
+    questions: list[str], options_by_question: list[list[str]],
+) -> list[dict]:
+    """Gera resumos (full + short) para cada pergunta, remove duplicatas de opções."""
+    items: list[dict] = []
+    for i, q in enumerate(questions):
+        opts = options_by_question[i] if i < len(options_by_question) else []
+        seen: set[str] = set()
+        unique_opts: list[str] = []
+        for opt in opts:
+            normalized = re.sub(r"\s+", " ", opt.strip().lower())
+            if normalized not in seen:
+                seen.add(normalized)
+                unique_opts.append(opt)
+
+        q_short = (q[:200] + "...") if len(q) > 200 else q
+        opts_short = [
+            (opt[:120] + "...") if len(opt) > 120 else opt
+            for opt in unique_opts
+        ]
+        items.append({
+            "question": q,
+            "question_short": q_short,
+            "options": unique_opts,
+            "options_short": opts_short,
+            "complete": len(unique_opts) >= 2,
+        })
+    return items
+
+
 def _fallback_collect_options(block_lines: list[str], max_opts: int = _MAX_OPTIONS_PER_QUESTION) -> list[str]:
     opts: list[str] = []
     for candidate in block_lines:
@@ -257,13 +539,8 @@ def _fallback_collect_options(block_lines: list[str], max_opts: int = _MAX_OPTIO
         cont_upper_wrap = bool(
             c
             and c[0].isupper()
-            and len(c) <= 70
             and not _line_looks_like_option_start(c)
-            and not re.match(
-                r"^(Which|What|Select|Choose|How|When|Where|Why|Qual|Como|Que)\b",
-                c,
-                re.I,
-            )
+            and not _is_question_text(c)
         )
         cont = cont or cont_upper_wrap
         if (
@@ -280,34 +557,297 @@ def _fallback_collect_options(block_lines: list[str], max_opts: int = _MAX_OPTIO
 
 # Win10 2004+: janela visível no seu monitor, mas não aparece na maioria dos compartilhamentos de tela
 _WDA_EXCLUDEFROMCAPTURE = 0x00000011
+_WDA_NONE = 0x00000000
+# GetAncestor: https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-getancestor
+_GA_ROOT = 2
+_GWL_EXSTYLE = -20
+_WS_EX_LAYERED = 0x00080000
 
 
-def _hwnd_exclude_from_screen_capture(hwnd: int) -> bool:
+def _set_window_display_affinity(hwnd: int, affinity: int) -> tuple[bool, str]:
     if os.name != "nt" or hwnd <= 0:
-        return False
+        return False, "Não-Windows ou HWND inválido."
     try:
         user32 = ctypes.windll.user32
         user32.SetWindowDisplayAffinity.argtypes = [ctypes.c_void_p, ctypes.c_uint]
         user32.SetWindowDisplayAffinity.restype = ctypes.c_int
-        return bool(user32.SetWindowDisplayAffinity(hwnd, _WDA_EXCLUDEFROMCAPTURE))
+        ok = bool(user32.SetWindowDisplayAffinity(hwnd, affinity))
+        if ok:
+            return True, "OK"
+        # Nem sempre há GetLastError útil aqui, mas ajuda quando existe.
+        try:
+            kernel32 = ctypes.windll.kernel32
+            kernel32.GetLastError.restype = ctypes.c_uint
+            err = int(kernel32.GetLastError())
+        except Exception:
+            err = 0
+        return False, f"Falhou (GetLastError={err})"
     except Exception:
-        return False
+        return False, "Exceção ao chamar SetWindowDisplayAffinity."
+
+
+def _hwnd_exclude_from_screen_capture(hwnd: int) -> tuple[bool, str]:
+    return _set_window_display_affinity(hwnd, _WDA_EXCLUDEFROMCAPTURE)
+
+
+def _collect_hwnd_candidates(tk_hwnd: int) -> list[int]:
+    """
+    No Tk/Win32, winfo_id() às vezes é filho; SetWindowDisplayAffinity no HWND errado não surte efeito.
+    Tenta o HWND do Tk, o ancestral ROOT e o pai — ordem favorece ROOT primeiro na aplicação.
+    """
+    out: list[int] = []
+    if tk_hwnd <= 0 or os.name != "nt":
+        return [tk_hwnd] if tk_hwnd > 0 else []
+
+    def add(h: int) -> None:
+        if h > 0 and h not in out:
+            out.append(h)
+
+    try:
+        user32 = ctypes.windll.user32
+        user32.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        user32.GetAncestor.restype = ctypes.c_void_p
+        user32.GetParent.argtypes = [ctypes.c_void_p]
+        user32.GetParent.restype = ctypes.c_void_p
+
+        root = int(user32.GetAncestor(tk_hwnd, _GA_ROOT) or 0)
+        parent = int(user32.GetParent(tk_hwnd) or 0)
+        # ROOT costuma ser o top-level que o DWM compõe na captura de desktop
+        add(root)
+        add(tk_hwnd)
+        add(parent)
+    except Exception:
+        add(tk_hwnd)
+    return out
+
+
+def _ensure_ws_ex_layered(hwnd: int) -> tuple[bool, str]:
+    """Opcional: alguns fluxos combinam layered + afinidade (não é garantia universal)."""
+    if hwnd <= 0 or os.name != "nt":
+        return False, "HWND inválido ou não-Windows."
+    try:
+        user32 = ctypes.windll.user32
+        if hasattr(user32, "GetWindowLongPtrW"):
+            get_long = user32.GetWindowLongPtrW
+            set_long = user32.SetWindowLongPtrW
+            get_long.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            get_long.restype = ctypes.c_void_p
+            set_long.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+            set_long.restype = ctypes.c_void_p
+            style = int(get_long(hwnd, _GWL_EXSTYLE) or 0)
+            new_style = style | _WS_EX_LAYERED
+            if new_style != style:
+                set_long(hwnd, _GWL_EXSTYLE, ctypes.c_void_p(new_style))
+        else:
+            get_long = user32.GetWindowLongW
+            set_long = user32.SetWindowLongW
+            get_long.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            get_long.restype = ctypes.c_long
+            set_long.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_long]
+            set_long.restype = ctypes.c_long
+            style = int(get_long(hwnd, _GWL_EXSTYLE))
+            new_style = style | _WS_EX_LAYERED
+            if new_style != style:
+                set_long(hwnd, _GWL_EXSTYLE, new_style)
+        return True, "OK"
+    except Exception as e:
+        return False, str(e)
+
+
+def _apply_exclude_from_capture_to_tk_root(root: tk.Misc) -> tuple[bool, str]:
+    """Aplica WDA_EXCLUDEFROMCAPTURE no(s) HWND(s) plausível(is) do root Tk."""
+    root.update_idletasks()
+    tk_hwnd = int(root.winfo_id())
+    candidates = _collect_hwnd_candidates(tk_hwnd)
+    if not candidates:
+        return False, "Nenhum HWND candidato."
+
+    last_detail = ""
+    for h in candidates:
+        ok, msg = _hwnd_exclude_from_screen_capture(h)
+        if ok:
+            return True, f"HWND 0x{h:x} | {msg}"
+        last_detail = f"0x{h:x}: {msg}"
+
+    if _env_flag("EXCLUDE_TRY_LAYERED") and candidates:
+        h0 = candidates[0]
+        _ok_l, _m = _ensure_ws_ex_layered(h0)
+        for h in candidates:
+            ok, msg = _hwnd_exclude_from_screen_capture(h)
+            if ok:
+                return True, f"HWND 0x{h:x} (após WS_EX_LAYERED) | {msg}"
+        last_detail = f"{last_detail}; layered({_m}): ainda falhou"
+
+    return False, last_detail
 
 
 def _preprocess_for_ocr(img_bgr: np.ndarray) -> np.ndarray:
-    """Escala leve + contraste: melhora leitura de texto em páginas web."""
+    """Binarizacao Otsu + CLAHE + sharpening para OCR preciso em paginas web."""
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape[:2]
     fast = _env_flag("OCR_FAST")
-    cap = 1.35 if fast else 2.0
-    if w < 1400:
-        scale = min(cap, 1400 / max(w, 1))
+    target_w = 1400 if fast else 2000
+    cap = 1.35 if fast else 2.5
+    if w < target_w:
+        scale = min(cap, target_w / max(w, 1))
         gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    _, gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # Card escuro (Canvas) pode ficar “preto demais” após Otsu; inverte para ajudar o Tesseract.
+    try:
+        if float(np.mean(gray)) < 80:
+            gray = 255 - gray
+    except Exception:
+        pass
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     gray = clahe.apply(gray)
     if fast:
         return gray
-    return cv2.bilateralFilter(gray, d=5, sigmaColor=45, sigmaSpace=45)
+    blur = cv2.GaussianBlur(gray, (0, 0), 1.0)
+    return cv2.addWeighted(gray, 1.5, blur, -0.5, 0)
+
+
+_MIN_WORD_CONF = int(os.environ.get("OCR_MIN_WORD_CONF", "15"))
+
+
+def _ocr_to_structured_lines(
+    proc_img, lang: str, config: str,
+) -> tuple[list[dict], str]:
+    """
+    OCR estruturado via image_to_data: retorna bounding boxes + confiança por palavra,
+    agrupadas em linhas lógicas. Cada linha é um dict com text, x0, y0, y1, avg_conf, word_count.
+    Retorna (linhas, texto bruto).
+    """
+    try:
+        data = pytesseract.image_to_data(
+            proc_img, lang=lang, config=config,
+            output_type=pytesseract.Output.DICT,
+        )
+    except Exception:
+        return _ocr_fallback_lines(proc_img, lang, config)
+
+    n = len(data.get("text", []))
+    if n == 0:
+        return _ocr_fallback_lines(proc_img, lang, config)
+
+    line_groups: dict[tuple[int, int, int], list[dict]] = {}
+    for i in range(n):
+        txt = (data["text"][i] or "").strip()
+        if not txt:
+            continue
+        raw_conf = str(data["conf"][i]).lstrip("-")
+        conf = int(raw_conf) if raw_conf.isdigit() else -1
+        if 0 <= conf < _MIN_WORD_CONF:
+            continue
+        key = (int(data["block_num"][i]), int(data["par_num"][i]), int(data["line_num"][i]))
+        if key not in line_groups:
+            line_groups[key] = []
+        line_groups[key].append({
+            "text": txt,
+            "conf": max(conf, 0),
+            "left": int(data["left"][i]),
+            "top": int(data["top"][i]),
+            "width": int(data["width"][i]),
+            "height": int(data["height"][i]),
+        })
+
+    raw_lines: list[dict] = []
+    for key in sorted(line_groups.keys()):
+        words = line_groups[key]
+        words.sort(key=lambda w: w["left"])
+        text = " ".join(w["text"] for w in words)
+        x0 = words[0]["left"]
+        y0 = min(w["top"] for w in words)
+        y1 = max(w["top"] + w["height"] for w in words)
+        confs = [w["conf"] for w in words if w["conf"] > 0]
+        avg_conf = sum(confs) / len(confs) if confs else 0.0
+        raw_lines.append({
+            "text": text, "x0": x0, "y0": y0, "y1": y1,
+            "avg_conf": avg_conf, "word_count": len(words),
+        })
+
+    raw_lines.sort(key=lambda ln: (ln["y0"], ln["x0"]))
+
+    lines: list[dict] = []
+    for ln in raw_lines:
+        if lines:
+            prev = lines[-1]
+            overlap_top = max(prev["y0"], ln["y0"])
+            overlap_bot = min(prev["y1"], ln["y1"])
+            prev_h = prev["y1"] - prev["y0"]
+            ln_h = ln["y1"] - ln["y0"]
+            min_h = min(prev_h, ln_h) if min(prev_h, ln_h) > 0 else 1
+            if (overlap_bot - overlap_top) / min_h > 0.5:
+                prev["text"] = prev["text"] + " " + ln["text"]
+                prev["y1"] = max(prev["y1"], ln["y1"])
+                prev["word_count"] += ln["word_count"]
+                prev["avg_conf"] = (prev["avg_conf"] + ln["avg_conf"]) / 2
+                continue
+        lines.append(dict(ln))
+
+    raw_text = "\n".join(ln["text"] for ln in lines)
+    return lines, raw_text
+
+
+def _ocr_fallback_lines(proc_img, lang: str, config: str) -> tuple[list[dict], str]:
+    """Fallback para image_to_string quando image_to_data falha."""
+    try:
+        raw = pytesseract.image_to_string(proc_img, lang=lang, config=config)
+    except Exception:
+        raw = pytesseract.image_to_string(proc_img, lang="eng", config=config)
+    lines: list[dict] = []
+    for i, line_text in enumerate(raw.split("\n")):
+        s = line_text.strip()
+        if s:
+            lines.append({
+                "text": s, "x0": 0, "y0": i * 20, "y1": (i + 1) * 20,
+                "avg_conf": 50.0, "word_count": len(s.split()),
+            })
+    return lines, raw
+
+
+def _is_junk_text(s: str) -> bool:
+    """Testa se a string casa com padrões de lixo (URLs, taskbar, menu, etc.)."""
+    if len(s) < 2:
+        return True
+    if _JUNK_LINE_RE.search(s):
+        return True
+    if s.count("|") >= 4 and len(s) > 40:
+        return True
+    if re.match(r"^[€$£\-\+\s\d\.\:]+$", s):
+        return True
+    if _DATE_TASKBAR_RE.search(s) and len(s) < 120:
+        return True
+    if "pesquisar" in s.lower() and len(s) < 90:
+        return True
+    if re.search(r"°\s*c|ºc|ensolarado|pred\s+ens", s, re.I):
+        return True
+    if _LMS_MENU_ONLY_RE.match(s):
+        return True
+    if re.search(r"Lucid\s*\(\s*Whiteboard", s, re.I) and len(s) < 100:
+        return True
+    if re.match(
+        r"^(Due|Points|Submitting|No\s+Due\s+Date|external\s+tool)\b", s, re.I
+    ) and len(s) < 80:
+        return True
+    if _URL_FRAGMENT_RE.search(s) and len(s) < 220:
+        return True
+    if _BREADCRUMB_ASSIGNMENTS_RE.search(s) and "Which" not in s and "What" not in s and len(s) < 200:
+        return True
+    if re.match(r"^Module\s+\d+\s+Knowledge\s+Check\s*$", s, re.I):
+        return True
+    return False
+
+
+def _filter_structured_lines(lines: list[dict]) -> list[dict]:
+    """Filtra linhas estruturadas removendo lixo por texto e baixa confiança."""
+    out: list[dict] = []
+    for ln in lines:
+        if ln["avg_conf"] < 10 and ln["avg_conf"] > 0 and ln["word_count"] < 5:
+            continue
+        if _is_junk_text(ln["text"].strip()):
+            continue
+        out.append(ln)
+    return out
 
 
 def _filter_ocr_lines(lines: list[str]) -> list[str]:
@@ -400,7 +940,7 @@ def _offline_websocket_suggestion(
 
 def _offline_fallback_suggestion(question: str, options: list[str]) -> tuple[str | None, str | None, str]:
     """
-    Quando não há Ollama: heurísticas mínimas por texto da pergunma + alternativas (sem rede).
+    Fallback sem LLM: heurísticas mínimas por texto da pergunta + alternativas (sem rede).
     Retorna (letra A-D, texto da opção, nota curta) ou (None, None, "").
     """
     q = (question or "").lower()
@@ -534,6 +1074,19 @@ def enrich_parsed_items(parsed: dict | None) -> dict | None:
     return parsed
 
 
+def align_llm_to_ocr(parsed: dict | None, options_by_question: list[list[str]]) -> dict | None:
+    """Realinha itens do LLM com as opções detectadas no OCR (pós-processamento)."""
+    if not parsed or not isinstance(parsed.get("items"), list):
+        return parsed
+    items = parsed.get("items") or []
+    if not isinstance(items, list):
+        return parsed
+    for i, it in enumerate(items):
+        ocr_opts = options_by_question[i] if i < len(options_by_question) else []
+        _align_llm_item_to_ocr(it, ocr_opts)
+    return parsed
+
+
 def _all_offline_covers_every_question(
     questions: list[str], options_by_question: list[list[str]]
 ) -> bool:
@@ -553,12 +1106,30 @@ class InvisibleScreenCapture:
         self.root.title("Invisible Capture")
         self.root.geometry("420x350+10+10")
 
-        self.root.attributes("-alpha", 0.95)
+        self.root.attributes("-alpha", 0.98)
         self.root.attributes("-topmost", True)
-        self.root.overrideredirect(True)
+        # Por padrão a janela é "borderless" (não aparece na barra de tarefas em alguns setups).
+        # Para depurar/usar no dia a dia: UI_BORDERLESS=0
+        self.root.overrideredirect(_env_flag_default("UI_BORDERLESS", False))
 
         # mss no Windows usa estado por thread — não reutilizar instância fora da thread que captura
         self._ocr_busy = False
+        self._llm_provider: AirLLMProvider | None = None
+
+        self._web_store = CaptureStore(
+            max_history=int(os.environ.get("WEB_HISTORY", "25")),
+        )
+        self._web_server = None
+        self._web_port = int(os.environ.get("WEB_PORT", "8765"))
+        self._web_url = f"http://127.0.0.1:{self._web_port}"
+        if _env_flag("WEB_ENABLE"):
+            try:
+                self._web_server, self._web_port, self._web_url = start_web_server(
+                    self._web_store, self._web_port,
+                )
+                print(f"Servidor web: {self._web_url}")
+            except Exception as e:
+                print(f"Falha ao iniciar servidor web: {e}")
 
         keyboard.add_hotkey("ctrl+shift+c", lambda: self.root.after(0, self.toggle_visibility))
         keyboard.add_hotkey("ctrl+shift+s", lambda: self.root.after(0, self.capture_screen))
@@ -567,16 +1138,25 @@ class InvisibleScreenCapture:
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
         self.setup_ui()
+        # Aplicar logo após criação e também quando a janela for "mapeada" (aparecer de fato).
         self.root.after(0, self._apply_exclude_from_capture)
+        self.root.bind("<Map>", lambda _e: self.root.after(0, self._apply_exclude_from_capture))
         self.root.mainloop()
 
     def _apply_exclude_from_capture(self):
-        self.root.update_idletasks()
-        hwnd = int(self.root.winfo_id())
-        ok = _hwnd_exclude_from_screen_capture(hwnd)
-        if not ok and os.name == "nt":
+        ok, msg = _apply_exclude_from_capture_to_tk_root(self.root)
+        if ok:
             self.status_label.config(
-                text="Aviso: exclusão de captura não aplicada (Windows 10 2004+ necessário) | Hotkeys: Ctrl+Shift+C, S, W"
+                text=f"Exclusão de captura: OK ({msg}) | Hotkeys: Ctrl+Shift+C, S, W"
+            )
+            return
+        if os.name == "nt":
+            self.status_label.config(
+                text=(
+                    "Aviso: exclusão de captura não aplicada em nenhum HWND candidato, "
+                    "ou o capturador ignora WDA_EXCLUDEFROMCAPTURE (comum em Tela inteira). "
+                    f"Detalhe: {msg} | Hotkeys: Ctrl+Shift+C, S, W"
+                )
             )
 
     def setup_ui(self):
@@ -585,18 +1165,18 @@ class InvisibleScreenCapture:
 
         self.status_label = ttk.Label(
             main_frame,
-            text="Visível para você | Oculto no compartilhamento de tela | Ctrl+Shift+C esconder/mostrar aqui",
+            text="Pronto | Hotkeys: Ctrl+Shift+S (tela), Ctrl+Shift+W (janela), Ctrl+Shift+C (mostrar/ocultar)",
             font=("Arial", 9),
         )
         self.status_label.pack(pady=5)
 
-        self.use_ollama = tk.BooleanVar(value=False)
-        self.chk_ollama = ttk.Checkbutton(
+        self.use_llm = tk.BooleanVar(value=True)
+        self.chk_llm = ttk.Checkbutton(
             main_frame,
-            text="Refinar com Ollama após captura (gemma3:4b)",
-            variable=self.use_ollama,
+            text="Refinar com IA local após captura (AirLLM)",
+            variable=self.use_llm,
         )
-        self.chk_ollama.pack(anchor=tk.W, pady=(0, 2))
+        self.chk_llm.pack(anchor=tk.W, pady=(0, 6))
 
         self.compact_quiz = tk.BooleanVar(value=_env_flag("UI_COMPACT_QUIZ"))
         self.chk_compact = ttk.Checkbutton(
@@ -632,15 +1212,62 @@ class InvisibleScreenCapture:
         self.btn_full.pack(side=tk.LEFT, padx=2)
         self.btn_win = ttk.Button(btn_frame, text="Capturar Janela Ativa", command=self.capture_active_window)
         self.btn_win.pack(side=tk.LEFT, padx=2)
+        self.btn_warm = ttk.Button(btn_frame, text="Warmup AirLLM", command=self.warmup_llm)
+        self.btn_warm.pack(side=tk.LEFT, padx=2)
         self.btn_clear = ttk.Button(btn_frame, text="Limpar", command=self.clear_text)
         self.btn_clear.pack(side=tk.LEFT, padx=2)
+        self.btn_web = ttk.Button(btn_frame, text="Abrir Web", command=self._open_web_page)
+        self.btn_web.pack(side=tk.LEFT, padx=2)
+        self.btn_copy = ttk.Button(btn_frame, text="Copiar", command=self.copy_results)
+        self.btn_copy.pack(side=tk.LEFT, padx=2)
+
+        self._last_results: dict | None = None
+
+    def _get_llm_provider(self) -> AirLLMProvider:
+        if self._llm_provider is not None:
+            return self._llm_provider
+        self._llm_provider = AirLLMProvider(
+            AirLLMConfig(model_id_or_path=os.environ.get("AIRLLM_MODEL", "").strip())
+        )
+        return self._llm_provider
+
+    def warmup_llm(self):
+        if self._ocr_busy:
+            return
+        self._set_busy(True)
+        self.status_label.config(text="AirLLM: carregando modelo (warmup)...")
+
+        def work():
+            try:
+                prov = self._get_llm_provider()
+                prov.warmup()
+                self.root.after(0, lambda: self.status_label.config(text="AirLLM: warmup concluído."))
+            except Exception as e:
+                self.root.after(0, lambda err=e: self.status_label.config(text=f"Erro no warmup AirLLM: {err}"))
+            finally:
+                self.root.after(0, lambda: self._set_busy(False))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _open_web_page(self):
+        if not self._web_server:
+            try:
+                self._web_server, self._web_port, self._web_url = start_web_server(
+                    self._web_store, self._web_port,
+                )
+            except Exception as e:
+                self.status_label.config(text=f"Erro ao iniciar servidor web: {e}")
+                return
+        # Sempre abrir no localhost neste PC (mais confiável que o IP da rede).
+        webbrowser.open(f"http://127.0.0.1:{self._web_port}")
 
     def _set_busy(self, busy: bool):
         self._ocr_busy = busy
         state = "disabled" if busy else "normal"
         self.btn_full.configure(state=state)
         self.btn_win.configure(state=state)
-        self.chk_ollama.configure(state=state)
+        self.btn_warm.configure(state=state)
+        self.chk_llm.configure(state=state)
         self.chk_compact.configure(state=state)
 
     def on_closing(self):
@@ -671,7 +1298,7 @@ class InvisibleScreenCapture:
             return
         self._set_busy(True)
         self.status_label.config(text="Capturando tela (OCR em segundo plano)...")
-        use_llm = self.use_ollama.get()
+        use_llm = self.use_llm.get()
 
         def work():
             try:
@@ -691,7 +1318,7 @@ class InvisibleScreenCapture:
             return
         self._set_busy(True)
         self.status_label.config(text="Capturando janela ativa (OCR em segundo plano)...")
-        use_llm = self.use_ollama.get()
+        use_llm = self.use_llm.get()
 
         def work():
             try:
@@ -717,115 +1344,38 @@ class InvisibleScreenCapture:
             self.text_area.delete(1.0, tk.END)
             self.text_area.insert(1.0, str(error))
             return
+        self._last_results = results
+        self._web_store.publish(results)
         self.display_results(results)
 
     def analyze_image(self, img, is_full_screen: bool = False):
         img = _crop_image_bgr(img, is_full_screen=is_full_screen)
         proc = _preprocess_for_ocr(img)
-        try:
-            text = pytesseract.image_to_string(proc, lang=_TESSERACT_LANG, config=_TESSERACT_CONFIG)
-        except Exception:
-            text = pytesseract.image_to_string(proc, lang="eng", config=_TESSERACT_CONFIG)
 
-        raw_lines = [line.strip() for line in text.split("\n")]
-        lines_all = [line for line in raw_lines if line]
-        lines = _filter_ocr_lines(lines_all)
-
-        # Palavras que iniciam pergunta sem gerar falso positivo em continuações ("when they submit...")
-        _safe_q_patterns = [
-            "Qual",
-            "Como",
-            "Que",
-            "Q:",
-            "Pergunta:",
-            "Which",
-            "What",
-            "Select",
-            "Choose",
-        ]
-        _q_start_re = re.compile(
-            r"^(\d+\.\s*)?(Qual|Como|Que|Q:|Pergunta:|Which|What|Select|Choose)\b",
-            re.I,
+        structured_lines, raw_text = _ocr_to_structured_lines(
+            proc, _TESSERACT_LANG, _TESSERACT_CONFIG,
         )
-        # How/When/Where/Why só no início da linha + auxiliar (evita "When they submit...")
-        _wh_aux_re = re.compile(
-            r"^(\d+\.\s*)?(How|When|Where|Why)\s+"
-            r"(do|does|did|is|are|can|could|should|would|will|must|many|much|to)\b",
-            re.I,
-        )
+        filtered = _filter_structured_lines(structured_lines)
+        questions, options_by_question = _parse_questions_structured(filtered)
+        summaries = _summarize_items(questions, options_by_question)
 
-        def _is_question_line(line: str) -> bool:
-            s = line.strip()
-            if _looks_like_url_line(s):
-                return False
-            if _BREADCRUMB_ASSIGNMENTS_RE.search(s) and "Which" not in s and "What" not in s:
-                return False
-            # Continuação de enunciado quebrado pelo OCR (ex.: "when they submit an order.")
-            if s and s[0].islower() and "?" not in s:
-                if not re.match(
-                    r"^(which|what|how|when|where|why|select|choose|qual|como|quando|onde)\b",
-                    s,
-                    re.I,
-                ):
-                    return False
-            # Heurística: só trata como pergunta quando o prefixo aparece no início
-            # (evita falso positivo quando palavras-chave aparecem “no meio” da alternativa).
-            if _q_start_re.match(s):
-                return True
-            if _wh_aux_re.match(s):
-                return True
-            if "?" in s and not _URL_FRAGMENT_RE.search(s):
-                if len(s) < 260 and re.search(
-                    r"\b(describe|best|correct|true|false|select|choose|suggests|option|phrase)\b",
-                    s,
-                    re.I,
-                ):
-                    return True
-            return False
 
-        questions: list[str] = []
-        options_by_question: list[list[str]] = []
-
-        i = 0
-        while i < len(lines):
-            line = lines[i]
-            if _is_question_line(line):
-                q_clean = _clean_question_line(line)
-                questions.append(q_clean if q_clean else line)
-
-                block_lines: list[str] = []
-                j = i + 1
-                while j < len(lines):
-                    candidate = lines[j]
-                    if _is_question_line(candidate):
-                        break
-                    block_lines.append(candidate)
-                    j += 1
-
-                block_text = "\n".join(block_lines)
-                split_opts = _split_options_from_block(block_text, _MAX_OPTIONS_PER_QUESTION)
-                fb_opts = _fallback_collect_options(block_lines, _MAX_OPTIONS_PER_QUESTION)
-                un_opts = _split_unnumbered_mcq_lines(block_lines, _MAX_OPTIONS_PER_QUESTION)
-                opts = _pick_best_options(split_opts, fb_opts, un_opts)
-
-                options_by_question.append(opts)
-                i = j
-                continue
-            i += 1
-
-        filtered_text = "\n".join(lines)
+        filtered_text = "\n".join(ln["text"] for ln in filtered)
         llm_compact = _build_llm_compact_block(questions, options_by_question)
         return {
-            "full_text": text,
+            "full_text": raw_text,
             "filtered_text": filtered_text,
             "llm_compact_text": llm_compact,
             "questions": questions,
             "options_by_question": options_by_question,
+            "summaries": summaries,
             "total_questions": len(questions),
         }
 
     def _pipeline_ocr_and_optional_llm(self, img, use_llm: bool, is_full_screen: bool = False):
+        t0 = time.perf_counter()
         detected = self.analyze_image(img, is_full_screen=is_full_screen)
+        detected["timings_ms"] = {"ocr_parse": int((time.perf_counter() - t0) * 1000)}
         want = use_llm
         detected["ollama_used"] = want
         detected["ollama_parsed"] = None
@@ -837,7 +1387,7 @@ class InvisibleScreenCapture:
 
         qs = detected.get("questions") or []
         obq = detected.get("options_by_question") or []
-        if _env_flag("SKIP_OLLAMA_WHEN_OFFLINE_FULL") and _all_offline_covers_every_question(qs, obq):
+        if _env_flag("SKIP_LLM_WHEN_OFFLINE_FULL") and _all_offline_covers_every_question(qs, obq):
             synthetic_items: list[dict] = []
             for i, q in enumerate(qs):
                 opts = list(obq[i]) if i < len(obq) else []
@@ -857,23 +1407,66 @@ class InvisibleScreenCapture:
             detected["ollama_skipped_offline_full"] = True
             return detected
 
-        self.root.after(0, lambda: self.status_label.config(text="Ollama: refinando texto (JSON)..."))
+        self.root.after(0, lambda: self.status_label.config(text="AirLLM: refinando texto (JSON)..."))
         try:
+            t_llm0 = time.perf_counter()
             llm_input = (detected.get("llm_compact_text") or "").strip()
             if len(llm_input) < 30:
                 llm_input = detected.get("filtered_text") or detected["full_text"]
-            prompt = build_quiz_refine_prompt(llm_input)
-            raw = ollama_complete(prompt)
-            detected["ollama_raw"] = raw
-            parsed, err = parse_items_from_llm_response(raw)
+            detected["ollama_used"] = False
+            detected["ollama_backend"] = "airllm"
+            self.root.after(0, lambda: self.status_label.config(text="AirLLM: refinando texto (JSON)..."))
+            provider = self._get_llm_provider()
+
+            two_pass = _env_flag_default("LLM_TWO_PASS", True)
+            if two_pass:
+                # Passo 1: extrair estrutura
+                p1 = build_quiz_extract_prompt(llm_input)
+                r1 = provider.complete(p1)
+                parsed1, err1 = parse_items_from_llm_response(r1.raw)
+                if not parsed1 or err1:
+                    detected["ollama_raw"] = r1.raw
+                    detected["ollama_error"] = err1 or "Falha no passo 1 (extract)."
+                    return detected
+
+                # Passo 2: sugerir alternativa em cima do JSON limpo
+                p2 = build_quiz_suggest_prompt(json.dumps(parsed1, ensure_ascii=False))
+                r2 = provider.complete(p2)
+                detected["ollama_raw"] = r2.raw
+                parsed2, err2 = parse_items_from_llm_response(r2.raw)
+                if not parsed2 or err2:
+                    detected["ollama_error"] = err2 or "Falha no passo 2 (suggest)."
+                    detected["ollama_parsed"] = parsed1
+                    return detected
+
+                # Merge: injeta suggested/confidence/note no parsed1
+                items1 = parsed1.get("items") if isinstance(parsed1.get("items"), list) else []
+                items2 = parsed2.get("items") if isinstance(parsed2.get("items"), list) else []
+                if isinstance(items1, list) and isinstance(items2, list):
+                    for i in range(min(len(items1), len(items2))):
+                        if isinstance(items1[i], dict) and isinstance(items2[i], dict):
+                            for k in ("suggested", "confidence", "note"):
+                                if k in items2[i] and items2[i].get(k) is not None:
+                                    items1[i][k] = items2[i].get(k)
+                parsed, err = parsed1, None
+            else:
+                prompt = build_quiz_refine_prompt(llm_input)
+                res = provider.complete(prompt)
+                detected["ollama_raw"] = res.raw
+                parsed, err = parse_items_from_llm_response(res.raw)
+
+            detected["timings_ms"]["llm"] = int((time.perf_counter() - t_llm0) * 1000)
             if parsed and not err:
                 parsed = enrich_parsed_items(parsed)
+                parsed = align_llm_to_ocr(parsed, detected.get("options_by_question") or [])
             detected["ollama_parsed"] = parsed
             detected["ollama_error"] = err
+        except LLMUnavailableError as e:
+            detected["ollama_error"] = str(e)
         except (ConnectionError, TimeoutError, ValueError) as e:
             detected["ollama_error"] = str(e)
         except Exception as e:
-            detected["ollama_error"] = f"Erro inesperado no Ollama: {e}"
+            detected["ollama_error"] = f"Erro inesperado no LLM: {e}"
         return detected
 
     def _configure_result_tags(self):
@@ -1007,7 +1600,7 @@ class InvisibleScreenCapture:
                 n_llm = len(results["ollama_parsed"]["items"])
             base = f"✅ {results['total_questions']} pergunta(s)"
             if results.get("ollama_skipped_offline_full"):
-                self.status_label.config(text=f"{base} | Respostas offline (Ollama não chamado)")
+                self.status_label.config(text=f"{base} | Respostas offline (LLM não chamado)")
             elif results.get("ollama_used"):
                 self.status_label.config(text=f"{base} | IA: {n_llm}")
             else:
@@ -1078,11 +1671,11 @@ class InvisibleScreenCapture:
                 ta.insert(tk.END, "\n  Trecho bruto do modelo:\n", ("meta",))
                 ta.insert(tk.END, f"  {snip}\n", ("tech",))
         else:
-            ta.insert(tk.END, "  Ollama desligado — usando pista offline se reconhecer a pergunma.\n", ("meta",))
+            ta.insert(tk.END, "  IA desligada — usando pista offline se reconhecer a pergunta.\n", ("meta",))
 
         if not ia_showed_suggestion and qs:
             ta.insert(tk.END, "\n")
-            ta.insert(tk.END, "  ► Resposta (sem Ollama — reconhecimento local)\n", ("ans_title",))
+            ta.insert(tk.END, "  ► Resposta (sem IA — reconhecimento local)\n", ("ans_title",))
             ta.insert(tk.END, "  Heurística no código; só cobre alguns enunciados típicos.\n\n", ("meta",))
             any_offline = False
             for idx, q in enumerate(qs[:6], start=1):
@@ -1095,8 +1688,7 @@ class InvisibleScreenCapture:
                     ta.insert(tk.END, f"  {text}\n", ("ans_body",))
                     ta.insert(tk.END, f"  {why}\n\n", ("meta",))
             if not any_offline:
-                ta.insert(tk.END, "  Nenhum padrão local bateu nesta captura. Use Ollama com modelo menor\n", ("meta",))
-                ta.insert(tk.END, "  (ex.: gemma3:4b) ou marque o checkbox quando a RAM permitir.\n", ("meta",))
+                ta.insert(tk.END, "  Nenhum padrão local bateu nesta captura. Use a IA (AirLLM) para refinar.\n", ("meta",))
 
         ta.insert(tk.END, "\n")
         ta.insert(tk.END, "  " + "─" * 40 + "\n", ("rule",))
@@ -1125,7 +1717,7 @@ class InvisibleScreenCapture:
             n_llm = len(results["ollama_parsed"]["items"])
         base = f"✅ {results['total_questions']} pergunta(s)"
         if results.get("ollama_skipped_offline_full"):
-            self.status_label.config(text=f"{base} | Respostas offline (Ollama não chamado)")
+            self.status_label.config(text=f"{base} | Respostas offline (LLM não chamado)")
         elif results.get("ollama_used"):
             self.status_label.config(text=f"{base} | IA: {n_llm}")
         else:
@@ -1133,20 +1725,44 @@ class InvisibleScreenCapture:
 
     def clear_text(self):
         self.text_area.delete(1.0, tk.END)
-        self.status_label.config(text="Status: Pronto para captura")
+        self.status_label.config(text="Pronto para captura")
+
+    def copy_results(self):
+        """Copia o resumo atual (modo compacto) ou o texto exibido."""
+        try:
+            txt = self.text_area.get("1.0", tk.END).strip()
+            if not txt:
+                return
+            self.root.clipboard_clear()
+            self.root.clipboard_append(txt)
+            self.status_label.config(text="Copiado para a área de transferência.")
+        except Exception as e:
+            self.status_label.config(text=f"Falha ao copiar: {e}")
 
 
 if __name__ == "__main__":
-    print("🚀 Programa iniciado!")
+    print("Programa iniciado!")
     print("A janela deve aparecer para você e ficar oculta na maioria dos compartilhamentos (Windows 10/11 recente).")
     print("Hotkeys: Ctrl+Shift+C (esconder/mostrar na sua tela), S (captura tela), W (janela ativa)")
     print("Requer Windows 10 versão 2004 ou superior para exclusão no compartilhamento.")
-    print("Ollama opcional: marque o checkbox na UI; env OLLAMA_HOST / OLLAMA_MODEL (padrão gemma3:4b).")
+    print("AirLLM: marque o checkbox na UI e configure AIRLLM_MODEL (repo HF ou caminho local).")
     print("OCR: TESSERACT_LANG=padrão eng+por; recorte tela inteira: OCR_CROP_LEFT/BOTTOM/RIGHT_FRAC (janela: OCR_CROP_WINDOW_*).")
-    print("Ollama: OLLAMA_NUM_CTX (padrão 2048, 0=omitir); OLLAMA_NUM_PREDICT (padrão 768); RAM baixa use modelo menor.")
+    print("AirLLM: AIRLLM_DEVICE=cpu (padrão); AIRLLM_MAX_INPUT_TOKENS e AIRLLM_MAX_NEW_TOKENS ajustam custo/latência.")
     print("Velocidade/UI: OCR_FAST=1 (OCR mais leve); UI_COMPACT_QUIZ=1 (lista compacta ao abrir);")
-    print("  SKIP_OLLAMA_WHEN_OFFLINE_FULL=1 (pula API se heurística offline cobrir todas as perguntas);")
+    print("  LLM_TWO_PASS=1 (padrão) melhora a estrutura quando OCR está ruidoso;")
     print("  UI_SHOW_CONFIDENCE=1 (no modo compacto, mostra linha de confiança quando existir).")
+    print(
+        "Exclusão de captura: WDA_EXCLUDEFROMCAPTURE em HWND do Tk + GetAncestor(ROOT); "
+        "EXCLUDE_TRY_LAYERED=1 força WS_EX_LAYERED no candidato e tenta de novo (opcional)."
+    )
+    print(
+        "Atenção: não há garantia de ocultar em todo app/modo (Discord/Teams/OBS podem ignorar ou preto/vazio variar)."
+    )
+    print(
+        "Web local: WEB_ENABLE=1 inicia servidor acessível na rede (celular). "
+        "WEB_PORT=8765 padrão, WEB_HISTORY=25. WEB_LOCAL_ONLY=1 restringe ao PC. "
+        "Botão 'Abrir Web' na UI também inicia sob demanda."
+    )
 
     if _env_flag("SHOW_EDU_SECURITY_BLURB"):
         print("")
